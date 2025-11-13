@@ -1,0 +1,30 @@
+# 仮想環境
+venv/
+env/
+
+# 環境変数（重要！）
+.env
+
+# Google認証情報（重要！）
+google-credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# テスト・一時ファイル
+output/
+*.jpg
+*.png
+test_app.py
+app_*.py
+
+# Mac
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

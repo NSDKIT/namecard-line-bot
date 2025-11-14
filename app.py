@@ -223,4 +223,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print(f"🚀 Namecard Bot with Database")
     print("=" * 60 + "\n")
-    app.run(host="127.0.0.1", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)  # 本番環境では0.0.0.0

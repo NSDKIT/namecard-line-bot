@@ -49,7 +49,7 @@ except Exception as e:
 
 @app.route("/")
 def hello():
-    return "Namecard Reader Bot is running! v5.0 - Multi-card support (up to 9 cards)"
+    return "Namecard Reader Bot is running! v5.0 - Simple OCR"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -89,9 +89,6 @@ def handle_text_message(event):
 1. 名刺の写真を撮影
 2. このトークに画像を送信
 3. 自動で名刺を読み取って保存！
-
-【複数枚対応】
-✨ 1枚の画像に最大9枚の名刺を並べて撮影できます！
 
 【コマンド】
 - 使い方 - このメッセージ
@@ -137,13 +134,13 @@ def handle_text_message(event):
                     for i, card in enumerate(namecards[:10], 1):
                         reply_text += f"【{i}】\n"
                         if card.get('name'):
-                            reply_text += f"👤 {card['name']}\n"
+                            reply_text += f"�� {card['name']}\n"
                         if card.get('company'):
                             reply_text += f"🏢 {card['company']}\n"
                         reply_text += "\n"
         
         elif user_message == "テスト":
-            reply_text = "✅ システム正常動作中！\n\n名刺の写真を送ってみてください。\n\n💡 1枚の画像に最大9枚の名刺を並べて撮影できます！"
+            reply_text = "✅ システム正常動作中！\n\n名刺の写真を送ってみてください。"
         
         else:
             reply_text = f"受信: {user_message}\n\n「使い方」で使い方を表示"
@@ -160,7 +157,7 @@ def handle_text_message(event):
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
-    """画像メッセージの処理（複数枚対応）"""
+    """画像メッセージの処理（修正版）"""
     line_user_id = event.source.user_id
     
     try:
@@ -176,7 +173,7 @@ def handle_image_message(event):
         
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="📸 画像を受信しました！\n名刺を読み取り中です...\n\n⏳ 10-20秒ほどお待ちください。")
+            TextSendMessage(text="📸 画像を受信しました！\n名刺を読み取り中です...\n\n⏳ 10-15秒ほどお待ちください。")
         )
         
         message_id = event.message.id
@@ -187,37 +184,43 @@ def handle_image_message(event):
                 temp_file.write(chunk)
             temp_file_path = temp_file.name
         
-        # 複数枚の名刺を処理
-        card_infos = ocr.process_image(temp_file_path)
+        # OCR処理
+        result = ocr.process_image(temp_file_path)
         
-        if not card_infos:
+        if not result:
             result_text = "❌ 名刺からテキストを検出できませんでした。"
-        elif isinstance(card_infos, list):
-            # 複数枚検出
-            saved_count = 0
-            result_text = f"✅ {len(card_infos)}枚の名刺を読み取りました！\n\n"
+        else:
+            # resultがリストの場合、最初の要素を取得
+            if isinstance(result, list):
+                card_info = result[0] if len(result) > 0 else None
+            else:
+                card_info = result
             
-            for i, card_info in enumerate(card_infos, 1):
+            if not card_info:
+                result_text = "❌ 名刺情報を抽出できませんでした。"
+            else:
+                # データベースに保存
                 saved = db.save_namecard(user['id'], card_info)
                 
                 if saved:
-                    saved_count += 1
                     db.increment_monthly_usage(user['id'])
                     
-                    result_text += f"【{i}】\n"
+                    result_text = "✅ 名刺を読み取って保存しました！\n\n"
+                    
                     if card_info.get('name'):
-                        result_text += f"👤 {card_info['name']}\n"
+                        result_text += f"👤 名前: {card_info['name']}\n"
                     if card_info.get('company'):
-                        result_text += f"🏢 {card_info['company']}\n"
+                        result_text += f"🏢 会社: {card_info['company']}\n"
                     if card_info.get('email'):
-                        result_text += f"📧 {card_info['email']}\n"
+                        result_text += f"📧 メール: {card_info['email']}\n"
                     if card_info.get('phone'):
-                        result_text += f"📞 {card_info['phone']}\n"
-                    result_text += "\n"
-            
-            result_text += f"💾 {saved_count}件をデータベースに保存しました\n「一覧」で確認できます"
-        else:
-            result_text = "❌ データベースへの保存に失敗しました。"
+                        result_text += f"📞 電話: {card_info['phone']}\n"
+                    if card_info.get('mobile'):
+                        result_text += f"📱 携帯: {card_info['mobile']}\n"
+                    
+                    result_text += "\n💾 データベースに保存しました\n「一覧」で確認できます"
+                else:
+                    result_text = "❌ データベースへの保存に失敗しました。"
         
         line_bot_api.push_message(
             line_user_id,

@@ -38,6 +38,7 @@ else:
 try:
     ocr = OCRProcessor()
     db = Database()
+    print("✅ Supabase connected")
     print("✅ OCR and Database initialized")
 except Exception as e:
     print(f"❌ Initialization error: {e}")
@@ -48,7 +49,7 @@ except Exception as e:
 
 @app.route("/")
 def hello():
-    return "Namecard Reader Bot is running! v4.0 with Database"
+    return "Namecard Reader Bot is running! v5.0 - Multi-card support (up to 9 cards)"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -89,10 +90,12 @@ def handle_text_message(event):
 2. このトークに画像を送信
 3. 自動で名刺を読み取って保存！
 
+【複数枚対応】
+✨ 1枚の画像に最大9枚の名刺を並べて撮影できます！
+
 【コマンド】
 - 使い方 - このメッセージ
 - 一覧 - 最新10件の名刺
-- 全件 - 全ての名刺
 - 検索 [キーワード] - 名刺を検索
 - テスト - 動作確認
 
@@ -140,7 +143,7 @@ def handle_text_message(event):
                         reply_text += "\n"
         
         elif user_message == "テスト":
-            reply_text = "✅ システム正常動作中！\n\n名刺の写真を送ってみてください。"
+            reply_text = "✅ システム正常動作中！\n\n名刺の写真を送ってみてください。\n\n💡 1枚の画像に最大9枚の名刺を並べて撮影できます！"
         
         else:
             reply_text = f"受信: {user_message}\n\n「使い方」で使い方を表示"
@@ -157,7 +160,7 @@ def handle_text_message(event):
 
 @handler.add(MessageEvent, message=ImageMessage)
 def handle_image_message(event):
-    """画像メッセージの処理"""
+    """画像メッセージの処理（複数枚対応）"""
     line_user_id = event.source.user_id
     
     try:
@@ -173,7 +176,7 @@ def handle_image_message(event):
         
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="📸 画像を受信しました！\n名刺を読み取り中です...\n\n⏳ 10-15秒ほどお待ちください。")
+            TextSendMessage(text="📸 画像を受信しました！\n名刺を読み取り中です...\n\n⏳ 10-20秒ほどお待ちください。")
         )
         
         message_id = event.message.id
@@ -184,30 +187,37 @@ def handle_image_message(event):
                 temp_file.write(chunk)
             temp_file_path = temp_file.name
         
-        card_info = ocr.process_image(temp_file_path)
+        # 複数枚の名刺を処理
+        card_infos = ocr.process_image(temp_file_path)
         
-        if not card_info:
+        if not card_infos:
             result_text = "❌ 名刺からテキストを検出できませんでした。"
-        else:
-            saved = db.save_namecard(user['id'], card_info)
+        elif isinstance(card_infos, list):
+            # 複数枚検出
+            saved_count = 0
+            result_text = f"✅ {len(card_infos)}枚の名刺を読み取りました！\n\n"
             
-            if saved:
-                db.increment_monthly_usage(user['id'])
+            for i, card_info in enumerate(card_infos, 1):
+                saved = db.save_namecard(user['id'], card_info)
                 
-                result_text = "✅ 名刺を読み取って保存しました！\n\n"
-                
-                if card_info.get('name'):
-                    result_text += f"👤 名前: {card_info['name']}\n"
-                if card_info.get('company'):
-                    result_text += f"🏢 会社: {card_info['company']}\n"
-                if card_info.get('email'):
-                    result_text += f"📧 メール: {card_info['email']}\n"
-                if card_info.get('phone'):
-                    result_text += f"📞 電話: {card_info['phone']}\n"
-                
-                result_text += "\n💾 データベースに保存しました\n「一覧」で確認できます"
-            else:
-                result_text = "❌ データベースへの保存に失敗しました。"
+                if saved:
+                    saved_count += 1
+                    db.increment_monthly_usage(user['id'])
+                    
+                    result_text += f"【{i}】\n"
+                    if card_info.get('name'):
+                        result_text += f"👤 {card_info['name']}\n"
+                    if card_info.get('company'):
+                        result_text += f"🏢 {card_info['company']}\n"
+                    if card_info.get('email'):
+                        result_text += f"📧 {card_info['email']}\n"
+                    if card_info.get('phone'):
+                        result_text += f"📞 {card_info['phone']}\n"
+                    result_text += "\n"
+            
+            result_text += f"💾 {saved_count}件をデータベースに保存しました\n「一覧」で確認できます"
+        else:
+            result_text = "❌ データベースへの保存に失敗しました。"
         
         line_bot_api.push_message(
             line_user_id,
@@ -220,6 +230,14 @@ def handle_image_message(event):
         print(f"❌ Image error: {e}")
         import traceback
         traceback.print_exc()
+        
+        try:
+            line_bot_api.push_message(
+                line_user_id,
+                TextSendMessage(text=f"❌ エラーが発生しました。\nもう一度お試しください。")
+            )
+        except:
+            pass
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

@@ -6,6 +6,7 @@ from linebot.models import (
 )
 import os
 import tempfile
+import base64
 from dotenv import load_dotenv
 from ocr_processor import OCRProcessor
 from database import Database
@@ -20,9 +21,30 @@ LINE_SECRET = os.getenv('LINE_CHANNEL_SECRET')
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
+# Google認証情報をBase64から復元
+if os.getenv('GOOGLE_CREDENTIALS_BASE64'):
+    try:
+        credentials_json = base64.b64decode(os.getenv('GOOGLE_CREDENTIALS_BASE64')).decode('utf-8')
+        with open('/tmp/google-credentials.json', 'w') as f:
+            f.write(credentials_json)
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/tmp/google-credentials.json'
+        print("✅ Google credentials loaded from environment variable")
+    except Exception as e:
+        print(f"❌ Error loading Google credentials: {e}")
+else:
+    print("⚠️ GOOGLE_CREDENTIALS_BASE64 not found in environment variables")
+
 # OCRとデータベースを初期化
-ocr = OCRProcessor(credentials_path='google-credentials.json')
-db = Database()
+try:
+    ocr = OCRProcessor()
+    db = Database()
+    print("✅ OCR and Database initialized")
+except Exception as e:
+    print(f"❌ Initialization error: {e}")
+    import traceback
+    traceback.print_exc()
+    ocr = None
+    db = None
 
 @app.route("/")
 def hello():
@@ -49,7 +71,13 @@ def handle_text_message(event):
     line_user_id = event.source.user_id
     
     try:
-        # ユーザー情報取得
+        if not db:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="システムエラー：データベースが利用できません")
+            )
+            return
+        
         profile = line_bot_api.get_profile(line_user_id)
         user = db.get_or_create_user(line_user_id, profile.display_name)
         
@@ -90,22 +118,6 @@ def handle_text_message(event):
                         reply_text += f"📞 {card['phone']}\n"
                     reply_text += "\n"
         
-        elif user_message == "全件":
-            namecards = db.get_all_user_namecards(user['id'])
-            
-            if not namecards:
-                reply_text = "まだ名刺が登録されていません。"
-            else:
-                reply_text = f"📇 全名刺（{len(namecards)}件）\n\n"
-                
-                for i, card in enumerate(namecards, 1):
-                    reply_text += f"【{i}】"
-                    if card.get('name'):
-                        reply_text += f" {card['name']}"
-                    if card.get('company'):
-                        reply_text += f" / {card['company']}"
-                    reply_text += "\n"
-        
         elif user_message.startswith("検索 "):
             keyword = user_message[3:].strip()
             
@@ -125,15 +137,10 @@ def handle_text_message(event):
                             reply_text += f"👤 {card['name']}\n"
                         if card.get('company'):
                             reply_text += f"🏢 {card['company']}\n"
-                        if card.get('email'):
-                            reply_text += f"📧 {card['email']}\n"
                         reply_text += "\n"
-                    
-                    if len(namecards) > 10:
-                        reply_text += f"\n※ 他{len(namecards) - 10}件"
         
         elif user_message == "テスト":
-            reply_text = "✅ OCR + データベース機能が有効です！"
+            reply_text = "✅ システム正常動作中！\n\n名刺の写真を送ってみてください。"
         
         else:
             reply_text = f"受信: {user_message}\n\n「使い方」で使い方を表示"
@@ -154,17 +161,21 @@ def handle_image_message(event):
     line_user_id = event.source.user_id
     
     try:
-        # ユーザー情報取得
+        if not ocr or not db:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="システムエラー：OCRまたはデータベースが利用できません")
+            )
+            return
+        
         profile = line_bot_api.get_profile(line_user_id)
         user = db.get_or_create_user(line_user_id, profile.display_name)
         
-        # 処理中メッセージ
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(text="📸 画像を受信しました！\n名刺を読み取り中です...\n\n⏳ 10-15秒ほどお待ちください。")
         )
         
-        # 画像をダウンロード
         message_id = event.message.id
         message_content = line_bot_api.get_message_content(message_id)
         
@@ -173,20 +184,16 @@ def handle_image_message(event):
                 temp_file.write(chunk)
             temp_file_path = temp_file.name
         
-        # OCR処理
         card_info = ocr.process_image(temp_file_path)
         
         if not card_info:
             result_text = "❌ 名刺からテキストを検出できませんでした。"
         else:
-            # データベースに保存
             saved = db.save_namecard(user['id'], card_info)
             
             if saved:
-                # 使用回数を増やす
                 db.increment_monthly_usage(user['id'])
                 
-                # 結果を整形
                 result_text = "✅ 名刺を読み取って保存しました！\n\n"
                 
                 if card_info.get('name'):
@@ -197,20 +204,16 @@ def handle_image_message(event):
                     result_text += f"📧 メール: {card_info['email']}\n"
                 if card_info.get('phone'):
                     result_text += f"📞 電話: {card_info['phone']}\n"
-                if card_info.get('mobile'):
-                    result_text += f"📱 携帯: {card_info['mobile']}\n"
                 
                 result_text += "\n💾 データベースに保存しました\n「一覧」で確認できます"
             else:
                 result_text = "❌ データベースへの保存に失敗しました。"
         
-        # 結果を送信
         line_bot_api.push_message(
             line_user_id,
             TextSendMessage(text=result_text)
         )
         
-        # 一時ファイル削除
         os.unlink(temp_file_path)
         
     except Exception as e:
@@ -220,7 +223,5 @@ def handle_image_message(event):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("\n" + "=" * 60)
-    print(f"🚀 Namecard Bot with Database")
-    print("=" * 60 + "\n")
-    app.run(host="0.0.0.0", port=port, debug=False)  # 本番環境では0.0.0.0
+    print(f"\n🚀 Namecard Bot Starting on port {port}\n")
+    app.run(host="0.0.0.0", port=port, debug=False)

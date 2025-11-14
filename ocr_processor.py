@@ -1,202 +1,227 @@
+from flask import Flask, request, abort
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
+from linebot.models import (
+    MessageEvent, TextMessage, ImageMessage, TextSendMessage
+)
 import os
-import cv2
-import numpy as np
-from google.cloud import vision
-import re
+import tempfile
+import base64
+from dotenv import load_dotenv
+from ocr_processor import OCRProcessor
+from database import Database
 
-class OCRProcessor:
-    def __init__(self, credentials_path=None):
-        """
-        OCRプロセッサーの初期化
-        """
-        if credentials_path:
-            os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials_path
-        
-        self.client = vision.ImageAnnotatorClient()
+load_dotenv()
+
+app = Flask(__name__)
+
+LINE_TOKEN = os.getenv('LINE_CHANNEL_ACCESS_TOKEN')
+LINE_SECRET = os.getenv('LINE_CHANNEL_SECRET')
+
+line_bot_api = LineBotApi(LINE_TOKEN)
+handler = WebhookHandler(LINE_SECRET)
+
+# Google認証情報をBase64から復元
+if os.getenv('GOOGLE_CREDENTIALS_BASE64'):
+    try:
+        credentials_json = base64.b64decode(os.getenv('GOOGLE_CREDENTIALS_BASE64')).decode('utf-8')
+        with open('/tmp/google-credentials.json', 'w') as f:
+            f.write(credentials_json)
+        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = '/tmp/google-credentials.json'
+        print("✅ Google credentials loaded from environment variable")
+    except Exception as e:
+        print(f"❌ Error loading Google credentials: {e}")
+else:
+    print("⚠️ GOOGLE_CREDENTIALS_BASE64 not found in environment variables")
+
+# OCRとデータベースを初期化
+try:
+    ocr = OCRProcessor()
+    db = Database()
+    print("✅ OCR and Database initialized")
+except Exception as e:
+    print(f"❌ Initialization error: {e}")
+    import traceback
+    traceback.print_exc()
+    ocr = None
+    db = None
+
+@app.route("/")
+def hello():
+    return "Namecard Reader Bot is running! v4.0 with Database"
+
+@app.route("/callback", methods=['POST'])
+def callback():
+    signature = request.headers.get('X-Line-Signature', '')
+    body = request.get_data(as_text=True)
     
-    def process_image(self, image_path):
-        """
-        画像から名刺情報を抽出
-        Returns: dict with extracted information
-        """
-        try:
-            print(f"🔍 Processing image: {image_path}")
-            
-            # 画像からテキストを抽出
-            text = self.ocr_image(image_path)
-            
-            if not text or not text.strip():
-                print("⚠️ No text detected")
-                return None
-            
-            print(f"📝 Detected text length: {len(text)} characters")
-            
-            # 情報を抽出
-            info = {
-                'name': self.extract_name(text),
-                'company': self.extract_company(text),
-                'email': self.extract_email(text),
-                'phone': self.extract_phone(text),
-                'mobile': self.extract_mobile(text),
-                'address': self.extract_address(text),
-                'website': self.extract_website(text),
-                'full_text': text
-            }
-            
-            print(f"✅ Extracted: {info['name']}, {info['company']}")
-            
-            return info
-        
-        except Exception as e:
-            print(f"❌ Error in process_image: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        abort(400)
+    except Exception as e:
+        print(f"❌ Error: {e}")
     
-    def ocr_image(self, image_path):
-        """Google Cloud Vision APIでOCR実行"""
-        try:
-            with open(image_path, 'rb') as image_file:
-                content = image_file.read()
-            
-            image = vision.Image(content=content)
-            
-            # 日本語と英語を指定
-            image_context = vision.ImageContext(language_hints=['ja', 'en'])
-            
-            response = self.client.text_detection(
-                image=image,
-                image_context=image_context
+    return 'OK'
+
+@handler.add(MessageEvent, message=TextMessage)
+def handle_text_message(event):
+    """テキストメッセージの処理"""
+    user_message = event.message.text
+    line_user_id = event.source.user_id
+    
+    try:
+        if not db:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="システムエラー：データベースが利用できません")
             )
+            return
+        
+        profile = line_bot_api.get_profile(line_user_id)
+        user = db.get_or_create_user(line_user_id, profile.display_name)
+        
+        if user_message == "使い方" or user_message == "ヘルプ":
+            reply_text = """📇 名刺読み取りBotの使い方
+
+【基本的な使い方】
+1. 名刺の写真を撮影
+2. このトークに画像を送信
+3. 自動で名刺を読み取って保存！
+
+【コマンド】
+- 使い方 - このメッセージ
+- 一覧 - 最新10件の名刺
+- 全件 - 全ての名刺
+- 検索 [キーワード] - 名刺を検索
+- テスト - 動作確認
+
+さっそく名刺を送ってみてください！📸"""
+        
+        elif user_message == "一覧":
+            namecards = db.get_user_namecards(user['id'], limit=10)
             
-            if response.error.message:
-                raise Exception(f'API Error: {response.error.message}')
+            if not namecards:
+                reply_text = "まだ名刺が登録されていません。\n名刺の写真を送ってください！"
+            else:
+                reply_text = f"📇 保存済み名刺（最新{len(namecards)}件）\n\n"
+                
+                for i, card in enumerate(namecards, 1):
+                    reply_text += f"【{i}】\n"
+                    if card.get('name'):
+                        reply_text += f"👤 {card['name']}\n"
+                    if card.get('company'):
+                        reply_text += f"🏢 {card['company']}\n"
+                    if card.get('email'):
+                        reply_text += f"📧 {card['email']}\n"
+                    if card.get('phone'):
+                        reply_text += f"📞 {card['phone']}\n"
+                    reply_text += "\n"
+        
+        elif user_message.startswith("検索 "):
+            keyword = user_message[3:].strip()
             
-            texts = response.text_annotations
+            if not keyword:
+                reply_text = "検索キーワードを入力してください。\n例: 検索 山田"
+            else:
+                namecards = db.search_namecards(user['id'], keyword)
+                
+                if not namecards:
+                    reply_text = f"「{keyword}」に一致する名刺が見つかりませんでした。"
+                else:
+                    reply_text = f"🔍 検索結果: {len(namecards)}件\n\n"
+                    
+                    for i, card in enumerate(namecards[:10], 1):
+                        reply_text += f"【{i}】\n"
+                        if card.get('name'):
+                            reply_text += f"👤 {card['name']}\n"
+                        if card.get('company'):
+                            reply_text += f"🏢 {card['company']}\n"
+                        reply_text += "\n"
+        
+        elif user_message == "テスト":
+            reply_text = "✅ システム正常動作中！\n\n名刺の写真を送ってみてください。"
+        
+        else:
+            reply_text = f"受信: {user_message}\n\n「使い方」で使い方を表示"
+        
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply_text)
+        )
+    
+    except Exception as e:
+        print(f"❌ Text error: {e}")
+        import traceback
+        traceback.print_exc()
+
+@handler.add(MessageEvent, message=ImageMessage)
+def handle_image_message(event):
+    """画像メッセージの処理"""
+    line_user_id = event.source.user_id
+    
+    try:
+        if not ocr or not db:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="システムエラー：OCRまたはデータベースが利用できません")
+            )
+            return
+        
+        profile = line_bot_api.get_profile(line_user_id)
+        user = db.get_or_create_user(line_user_id, profile.display_name)
+        
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="📸 画像を受信しました！\n名刺を読み取り中です...\n\n⏳ 10-15秒ほどお待ちください。")
+        )
+        
+        message_id = event.message.id
+        message_content = line_bot_api.get_message_content(message_id)
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+            for chunk in message_content.iter_content():
+                temp_file.write(chunk)
+            temp_file_path = temp_file.name
+        
+        card_info = ocr.process_image(temp_file_path)
+        
+        if not card_info:
+            result_text = "❌ 名刺からテキストを検出できませんでした。"
+        else:
+            saved = db.save_namecard(user['id'], card_info)
             
-            if texts:
-                return texts[0].description
-            
-            return ""
+            if saved:
+                db.increment_monthly_usage(user['id'])
+                
+                result_text = "✅ 名刺を読み取って保存しました！\n\n"
+                
+                if card_info.get('name'):
+                    result_text += f"👤 名前: {card_info['name']}\n"
+                if card_info.get('company'):
+                    result_text += f"🏢 会社: {card_info['company']}\n"
+                if card_info.get('email'):
+                    result_text += f"📧 メール: {card_info['email']}\n"
+                if card_info.get('phone'):
+                    result_text += f"📞 電話: {card_info['phone']}\n"
+                
+                result_text += "\n💾 データベースに保存しました\n「一覧」で確認できます"
+            else:
+                result_text = "❌ データベースへの保存に失敗しました。"
         
-        except Exception as e:
-            print(f"❌ OCR Error: {e}")
-            raise
-    
-    def extract_email(self, text):
-        """メールアドレスを抽出"""
-        pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-        emails = re.findall(pattern, text)
-        return emails[0] if emails else None
-    
-    def extract_phone(self, text):
-        """固定電話番号を抽出"""
-        text_cleaned = text.replace(' ', '').replace('　', '')
+        line_bot_api.push_message(
+            line_user_id,
+            TextSendMessage(text=result_text)
+        )
         
-        patterns = [
-            r'(?:TEL|Tel|tel|電話)?[:\s]*0\d{1,4}-\d{1,4}-\d{4}',
-            r'(?:TEL|Tel|tel|電話)?[:\s]*0\d{9,10}',
-        ]
+        os.unlink(temp_file_path)
         
-        for pattern in patterns:
-            phones = re.findall(pattern, text_cleaned, re.IGNORECASE)
-            if phones:
-                phone = re.sub(r'(?:TEL|Tel|tel|電話)[:\s]*', '', phones[0], flags=re.IGNORECASE)
-                # 携帯番号は除外
-                if not phone.startswith(('070', '080', '090')):
-                    return phone
-        
-        return None
-    
-    def extract_mobile(self, text):
-        """携帯電話番号を抽出"""
-        text_cleaned = text.replace(' ', '').replace('　', '')
-        pattern = r'(?:Mobile|mobile|携帯|FAX)?[:\s]*0[789]0-?\d{4}-?\d{4}'
-        mobiles = re.findall(pattern, text_cleaned, re.IGNORECASE)
-        
-        for mobile in mobiles:
-            # FAXは除外
-            if 'FAX' not in mobile and 'fax' not in mobile:
-                cleaned = re.sub(r'(?:Mobile|mobile|携帯)[:\s]*', '', mobile, flags=re.IGNORECASE)
-                return cleaned
-        
-        return None
-    
-    def extract_name(self, text):
-        """名前を抽出"""
-        lines = text.split('\n')
-        
-        for line in lines[:5]:
-            line = line.strip()
-            
-            # 日本語名のパターン（姓名の間にスペースがある）
-            if re.match(r'^[\u4E00-\u9FFF]{2,4}[\s　]+[\u4E00-\u9FFF]{1,4}$', line):
-                return line
-            
-            # 英語名のパターン
-            if re.match(r'^[A-Z][a-z]+\s+[A-Z][a-z]+$', line):
-                return line
-        
-        return None
-    
-    def extract_company(self, text):
-        """会社名を抽出"""
-        keywords = [
-            '株式会社', '有限会社', '合同会社', '合資会社',
-            '社団法人', '財団法人', '医療法人',
-            'Co.', 'Ltd.', 'Inc.', 'Corporation', 'Corp.',
-            'K.K.', 'GK'
-        ]
-        
-        lines = text.split('\n')
-        
-        for line in lines[:10]:
-            for keyword in keywords:
-                if keyword in line:
-                    return line.strip()
-        
-        return None
-    
-    def extract_address(self, text):
-        """住所を抽出"""
-        # 郵便番号パターン
-        zipcode_pattern = r'〒?\d{3}-?\d{4}'
-        
-        # 都道府県パターン
-        prefectures = [
-            '北海道', '青森県', '岩手県', '宮城県', '秋田県', '山形県', '福島県',
-            '茨城県', '栃木県', '群馬県', '埼玉県', '千葉県', '東京都', '神奈川県',
-            '新潟県', '富山県', '石川県', '福井県', '山梨県', '長野県', '岐阜県',
-            '静岡県', '愛知県', '三重県', '滋賀県', '京都府', '大阪府', '兵庫県',
-            '奈良県', '和歌山県', '鳥取県', '島根県', '岡山県', '広島県', '山口県',
-            '徳島県', '香川県', '愛媛県', '高知県', '福岡県', '佐賀県', '長崎県',
-            '熊本県', '大分県', '宮崎県', '鹿児島県', '沖縄県'
-        ]
-        
-        lines = text.split('\n')
-        
-        for i, line in enumerate(lines):
-            # 郵便番号または都道府県を含む行を探す
-            if re.search(zipcode_pattern, line) or any(pref in line for pref in prefectures):
-                # 住所は複数行にまたがることがあるので次の行も含める
-                address = line
-                if i + 1 < len(lines):
-                    address += ' ' + lines[i + 1]
-                return address.strip()
-        
-        return None
-    
-    def extract_website(self, text):
-        """Webサイトを抽出"""
-        patterns = [
-            r'https?://[^\s]+',
-            r'www\.[^\s]+',
-            r'[a-zA-Z0-9.-]+\.(com|co\.jp|jp|net|org|info)'
-        ]
-        
-        for pattern in patterns:
-            websites = re.findall(pattern, text, re.IGNORECASE)
-            if websites:
-                return websites[0].strip()
-        
-        return None
+    except Exception as e:
+        print(f"❌ Image error: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print(f"\n🚀 Namecard Bot Starting on port {port}\n")
+    app.run(host="0.0.0.0", port=port, debug=False)
